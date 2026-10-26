@@ -1,3 +1,4 @@
+import asyncio
 import os
 import re
 import time
@@ -7,14 +8,43 @@ from fastapi import FastAPI, Request
 
 app = FastAPI()
 
-# ---------- НАСТРОЙКИ (берутся из переменных окружения Render) ----------
+# =====================================================================
+# НАСТРОЙКИ. Всё берётся из переменных окружения Render.
+# Если переменной нет — используется значение по умолчанию (второе в скобках).
+# =====================================================================
+
+# Порядок моделей: первая — основная, дальше запасные (через запятую)
+PROVIDER_ORDER = [
+    p.strip()
+    for p in os.environ.get("PROVIDER_ORDER", "groq,gemini,openrouter").split(",")
+    if p.strip()
+]
+# Сколько секунд всего даём на все попытки (у Алисы лимит 4,5 с на весь путь)
+TOTAL_BUDGET = float(os.environ.get("TOTAL_BUDGET", "3.8"))
+# Если осталось меньше этого — следующую модель уже не пробуем
+MIN_ATTEMPT_TIME = 0.5
+
+# --- Groq ---
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_TIMEOUT = float(os.environ.get("GROQ_TIMEOUT", "2.0"))
+
+# --- Gemini ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
-GEMINI_TIMEOUT = float(os.environ.get("GEMINI_TIMEOUT", "3.5"))
+GEMINI_TIMEOUT = float(os.environ.get("GEMINI_TIMEOUT", "1.5"))
+
+# --- OpenRouter ---
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "")
+OPENROUTER_TIMEOUT = float(os.environ.get("OPENROUTER_TIMEOUT", "1.5"))
+
 # Пароль для проверочного адреса /debug. Если не задан — адрес выключен.
 DEBUG_TOKEN = os.environ.get("DEBUG_TOKEN", "")
 
-# ---------- ТЕКСТЫ ----------
+# =====================================================================
+# ТЕКСТЫ
+# =====================================================================
 SYSTEM_PROMPT = (
     "Ты голосовой помощник в колонке. Отвечай по-русски, коротко: одно-два "
     "предложения. Без списков, без markdown, без эмодзи, без ссылок — текст "
@@ -41,6 +71,9 @@ ABILITIES_COMMANDS = {"что ты умеешь", "что умеешь", "что
 http_client = httpx.AsyncClient()
 
 
+# =====================================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# =====================================================================
 def make_response(text: str, end_session: bool = False) -> dict:
     """Собирает ответ в формате Яндекс Диалогов."""
     return {
@@ -66,8 +99,13 @@ def describe_error(e: Exception) -> str:
     return f"{type(e).__name__}: {e}"
 
 
-async def ask_gemini(question: str, timeout: float) -> str:
-    """Отправляет вопрос в Gemini и возвращает текст ответа."""
+# =====================================================================
+# МОДЕЛИ
+# =====================================================================
+async def ask_gemini(question: str) -> str:
+    """Запрос к Gemini."""
+    if not GEMINI_API_KEY:
+        raise RuntimeError("нет ключа GEMINI_API_KEY")
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
         f"{GEMINI_MODEL}:generateContent"
@@ -78,47 +116,133 @@ async def ask_gemini(question: str, timeout: float) -> str:
         "contents": [{"role": "user", "parts": [{"text": question}]}],
         "generationConfig": {"maxOutputTokens": 400, "temperature": 0.7},
     }
-
-    resp = await http_client.post(url, headers=headers, json=payload, timeout=timeout)
+    resp = await http_client.post(url, headers=headers, json=payload, timeout=30)
     if resp.status_code != 200:
-        raise RuntimeError(f"Gemini HTTP {resp.status_code}: {resp.text[:300]}")
-
+        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
     data = resp.json()
     parts = data["candidates"][0]["content"]["parts"]
-    answer = " ".join(p.get("text", "") for p in parts if not p.get("thought"))
-    answer = clean_for_voice(answer)
+    answer = clean_for_voice(" ".join(p.get("text", "") for p in parts if not p.get("thought")))
     if not answer:
-        raise RuntimeError(f"Gemini вернул пустой ответ: {str(data)[:300]}")
+        raise RuntimeError("пустой ответ")
     return answer
 
 
+async def ask_openai_style(url: str, api_key: str, model: str, question: str) -> str:
+    """Запрос к сервисам с форматом как у OpenAI (Groq и OpenRouter устроены так)."""
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": question},
+        ],
+        "max_tokens": 300,
+        "temperature": 0.7,
+    }
+    resp = await http_client.post(url, headers=headers, json=payload, timeout=30)
+    if resp.status_code != 200:
+        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+    data = resp.json()
+    answer = clean_for_voice(data["choices"][0]["message"].get("content") or "")
+    if not answer:
+        raise RuntimeError("пустой ответ")
+    return answer
+
+
+async def ask_groq(question: str) -> str:
+    if not GROQ_API_KEY:
+        raise RuntimeError("нет ключа GROQ_API_KEY")
+    return await ask_openai_style(
+        "https://api.groq.com/openai/v1/chat/completions", GROQ_API_KEY, GROQ_MODEL, question
+    )
+
+
+async def ask_openrouter(question: str) -> str:
+    if not OPENROUTER_API_KEY or not OPENROUTER_MODEL:
+        raise RuntimeError("не заданы OPENROUTER_API_KEY или OPENROUTER_MODEL")
+    return await ask_openai_style(
+        "https://openrouter.ai/api/v1/chat/completions",
+        OPENROUTER_API_KEY,
+        OPENROUTER_MODEL,
+        question,
+    )
+
+
+# Название -> (функция, сколько максимум ждём эту модель)
+PROVIDERS = {
+    "groq": (ask_groq, GROQ_TIMEOUT),
+    "gemini": (ask_gemini, GEMINI_TIMEOUT),
+    "openrouter": (ask_openrouter, OPENROUTER_TIMEOUT),
+}
+
+
+async def ask_with_fallback(question: str, total_budget: float):
+    """
+    Пробует модели по очереди из PROVIDER_ORDER.
+    Возвращает (ответ, имя_модели, журнал). Если никто не ответил — (None, None, журнал).
+    """
+    start = time.monotonic()
+    log = []
+    for name in PROVIDER_ORDER:
+        if name not in PROVIDERS:
+            log.append(f"{name}: неизвестное имя, пропуск")
+            continue
+        func, provider_timeout = PROVIDERS[name]
+
+        remaining = total_budget - (time.monotonic() - start)
+        if remaining < MIN_ATTEMPT_TIME:
+            log.append("время вышло")
+            break
+        timeout = min(provider_timeout, remaining)
+
+        t0 = time.monotonic()
+        try:
+            # wait_for жёстко обрывает запрос, если он идёт дольше timeout
+            answer = await asyncio.wait_for(func(question), timeout=timeout)
+            log.append(f"{name}: ок за {time.monotonic() - t0:.2f} с")
+            return answer, name, log
+        except Exception as e:
+            log.append(f"{name}: {describe_error(e)[:200]} ({time.monotonic() - t0:.2f} с)")
+    return None, None, log
+
+
+# =====================================================================
+# АДРЕСА СЕРВЕРА
+# =====================================================================
 @app.api_route("/", methods=["GET", "HEAD"])
 def health_check():
     return {"status": "ok"}
 
 
-# Проверочный адрес: открываешь в браузере, ждёт Gemini до 25 секунд
 @app.get("/debug")
-async def debug(token: str = "", q: str = "Сколько планет в Солнечной системе?"):
+async def debug(token: str = "", q: str = "Сколько планет в Солнечной системе?", only: str = ""):
+    """
+    Проверка в браузере.
+    /debug?token=ПАРОЛЬ            — вся цепочка, как для Алисы (с лимитом времени)
+    /debug?token=ПАРОЛЬ&only=groq  — только одна модель, ждём до 25 секунд
+    """
     if not DEBUG_TOKEN or token != DEBUG_TOKEN:
         return {"error": "нет доступа"}
+
     start = time.monotonic()
-    try:
-        answer = await ask_gemini(q, timeout=25)
-        return {
-            "ok": True,
-            "model": GEMINI_MODEL,
-            "seconds": round(time.monotonic() - start, 2),
-            "answer": answer,
-        }
-    except Exception as e:
-        return {
-            "ok": False,
-            "model": GEMINI_MODEL,
-            "seconds": round(time.monotonic() - start, 2),
-            "error": describe_error(e),
-            "key_is_set": bool(GEMINI_API_KEY),  # только да/нет, сам ключ не показываем
-        }
+    if only:
+        if only not in PROVIDERS:
+            return {"error": f"нет модели {only}, есть: {list(PROVIDERS)}"}
+        try:
+            answer = await asyncio.wait_for(PROVIDERS[only][0](q), timeout=25)
+            return {"ok": True, "provider": only, "seconds": round(time.monotonic() - start, 2), "answer": answer}
+        except Exception as e:
+            return {"ok": False, "provider": only, "seconds": round(time.monotonic() - start, 2), "error": describe_error(e)}
+
+    answer, name, log = await ask_with_fallback(q, TOTAL_BUDGET)
+    return {
+        "ok": answer is not None,
+        "answered_by": name,
+        "seconds": round(time.monotonic() - start, 2),
+        "answer": answer or FALLBACK_TEXT,
+        "log": log,
+        "order": PROVIDER_ORDER,
+    }
 
 
 @app.post("/")
@@ -147,11 +271,6 @@ async def alice_webhook(request: Request):
     if not command:
         return make_response("Не расслышал, повтори, пожалуйста.")
 
-    start = time.monotonic()
-    try:
-        answer = await ask_gemini(utterance or command, timeout=GEMINI_TIMEOUT)
-        print(f"Вопрос: {utterance!r} | Gemini за {time.monotonic() - start:.2f} с", flush=True)
-        return make_response(answer)
-    except Exception as e:
-        print(f"ОШИБКА за {time.monotonic() - start:.2f} с: {describe_error(e)}", flush=True)
-        return make_response(FALLBACK_TEXT)
+    answer, name, log = await ask_with_fallback(utterance or command, TOTAL_BUDGET)
+    print(f"Вопрос: {utterance!r} | " + " | ".join(log), flush=True)
+    return make_response(answer if answer else FALLBACK_TEXT)
