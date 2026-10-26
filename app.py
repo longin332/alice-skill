@@ -8,12 +8,11 @@ from fastapi import FastAPI, Request
 app = FastAPI()
 
 # ---------- НАСТРОЙКИ (берутся из переменных окружения Render) ----------
-# Ключ: только из окружения, в коде его нет
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-# Модель можно сменить на Render, не трогая код
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
-# Сколько секунд ждём Gemini. У Алисы всего 4,5 с на весь ответ.
 GEMINI_TIMEOUT = float(os.environ.get("GEMINI_TIMEOUT", "3.5"))
+# Пароль для проверочного адреса /debug. Если не задан — адрес выключен.
+DEBUG_TOKEN = os.environ.get("DEBUG_TOKEN", "")
 
 # ---------- ТЕКСТЫ ----------
 SYSTEM_PROMPT = (
@@ -39,7 +38,6 @@ FALLBACK_TEXT = "Сейчас не получается ответить, поп
 HELP_COMMANDS = {"помощь", "помоги", "справка"}
 ABILITIES_COMMANDS = {"что ты умеешь", "что умеешь", "что ты можешь"}
 
-# Один клиент на всё время работы: соединение переиспользуется, так быстрее
 http_client = httpx.AsyncClient()
 
 
@@ -52,9 +50,9 @@ def make_response(text: str, end_session: bool = False) -> dict:
 
 
 def clean_for_voice(text: str) -> str:
-    """Убирает markdown-символы и обрезает до лимита Яндекса (1024 символа)."""
-    text = re.sub(r"[*#_`>]", "", text)      # звёздочки, решётки и т.п.
-    text = re.sub(r"\s+", " ", text).strip()  # лишние пробелы и переносы
+    """Убирает markdown-символы и обрезает до лимита Яндекса."""
+    text = re.sub(r"[*#_`>]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
     if len(text) > 1000:
         text = text[:1000]
         last_dot = text.rfind(".")
@@ -63,7 +61,12 @@ def clean_for_voice(text: str) -> str:
     return text
 
 
-async def ask_gemini(question: str) -> str:
+def describe_error(e: Exception) -> str:
+    """Название ошибки + текст, чтобы в логах было понятно, что случилось."""
+    return f"{type(e).__name__}: {e}"
+
+
+async def ask_gemini(question: str, timeout: float) -> str:
     """Отправляет вопрос в Gemini и возвращает текст ответа."""
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -76,28 +79,48 @@ async def ask_gemini(question: str) -> str:
         "generationConfig": {"maxOutputTokens": 400, "temperature": 0.7},
     }
 
-    resp = await http_client.post(url, headers=headers, json=payload, timeout=GEMINI_TIMEOUT)
+    resp = await http_client.post(url, headers=headers, json=payload, timeout=timeout)
     if resp.status_code != 200:
-        # Пишем в лог код и начало текста ошибки (ключ туда не попадает)
         raise RuntimeError(f"Gemini HTTP {resp.status_code}: {resp.text[:300]}")
 
     data = resp.json()
     parts = data["candidates"][0]["content"]["parts"]
-    # Берём только текст ответа, пропуская служебные "мысли" модели
     answer = " ".join(p.get("text", "") for p in parts if not p.get("thought"))
     answer = clean_for_voice(answer)
     if not answer:
-        raise RuntimeError("Gemini вернул пустой ответ")
+        raise RuntimeError(f"Gemini вернул пустой ответ: {str(data)[:300]}")
     return answer
 
 
-# Проверка, что сервер жив (сюда стучит будильник cron-job.org)
 @app.api_route("/", methods=["GET", "HEAD"])
 def health_check():
     return {"status": "ok"}
 
 
-# Сюда Яндекс присылает фразы пользователя
+# Проверочный адрес: открываешь в браузере, ждёт Gemini до 25 секунд
+@app.get("/debug")
+async def debug(token: str = "", q: str = "Сколько планет в Солнечной системе?"):
+    if not DEBUG_TOKEN or token != DEBUG_TOKEN:
+        return {"error": "нет доступа"}
+    start = time.monotonic()
+    try:
+        answer = await ask_gemini(q, timeout=25)
+        return {
+            "ok": True,
+            "model": GEMINI_MODEL,
+            "seconds": round(time.monotonic() - start, 2),
+            "answer": answer,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "model": GEMINI_MODEL,
+            "seconds": round(time.monotonic() - start, 2),
+            "error": describe_error(e),
+            "key_is_set": bool(GEMINI_API_KEY),  # только да/нет, сам ключ не показываем
+        }
+
+
 @app.post("/")
 async def alice_webhook(request: Request):
     try:
@@ -107,14 +130,12 @@ async def alice_webhook(request: Request):
 
     req = data.get("request", {})
     session = data.get("session", {})
-    command = req.get("command", "").strip().lower()          # фраза, очищенная Яндексом
-    utterance = req.get("original_utterance", "").strip()     # фраза как есть
+    command = req.get("command", "").strip().lower()
+    utterance = req.get("original_utterance", "").strip()
 
-    # Служебная проверка от Яндекса — отвечаем мгновенно
     if utterance.lower() == "ping":
         return make_response("pong")
 
-    # Навык только что запустили без вопроса — приветствие
     if session.get("new") and not command:
         return make_response(WELCOME_TEXT)
 
@@ -126,12 +147,11 @@ async def alice_webhook(request: Request):
     if not command:
         return make_response("Не расслышал, повтори, пожалуйста.")
 
-    # Основное: спрашиваем Gemini
     start = time.monotonic()
     try:
-        answer = await ask_gemini(utterance or command)
+        answer = await ask_gemini(utterance or command, timeout=GEMINI_TIMEOUT)
         print(f"Вопрос: {utterance!r} | Gemini за {time.monotonic() - start:.2f} с", flush=True)
         return make_response(answer)
     except Exception as e:
-        print(f"ОШИБКА за {time.monotonic() - start:.2f} с: {e}", flush=True)
+        print(f"ОШИБКА за {time.monotonic() - start:.2f} с: {describe_error(e)}", flush=True)
         return make_response(FALLBACK_TEXT)
