@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: alice-skill
+    runtime: python
+    plan: free
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      # --- Обязательные: Render спросит их при создании ---
+      - key: GROQ_API_KEY
+        sync: false
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false
+      - key: TAVILY_API_KEY
+        sync: false
+      # --- Необязательные: можно оставить пустыми ---
+      - key: GEMINI_API_KEY
+        sync: false
+      # --- Уже настроенные значения ---
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-20b
+      - key: DEBUG_TOKEN
+        generateValue: true
