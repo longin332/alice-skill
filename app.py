@@ -4,6 +4,7 @@ import json
 import os
 import re
 import time
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, Request
@@ -57,6 +58,24 @@ CACHE_SKIP_WORDS = [
     if w.strip()
 ]
 
+# --- Поиск (Tavily или Serper) ---
+SEARCH_PROVIDER = os.environ.get("SEARCH_PROVIDER", "tavily").strip().lower()
+TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
+TAVILY_DEPTH = os.environ.get("TAVILY_DEPTH", "ultra-fast")
+SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
+SEARCH_ENABLED = os.environ.get("SEARCH_ENABLED", "1") == "1"
+SEARCH_TIMEOUT = float(os.environ.get("SEARCH_TIMEOUT", "1.5"))
+SEARCH_TRIGGER_WORDS = [
+    w.strip()
+    for w in os.environ.get(
+        "SEARCH_TRIGGER_WORDS",
+        "сегодня,сейчас,завтра,вчера,погод,курс,новост,последн,свеж,актуальн,"
+        "найди,поищи,загугли,в интернете,цена,сколько стоит,счет матча,202",
+    ).split(",")
+    if w.strip()
+]
+TIME_LEFT_FOR_MODELS = 1.0  # сколько времени модели должно остаться после поиска
+
 # --- Пароль для /debug ---
 DEBUG_TOKEN = os.environ.get("DEBUG_TOKEN", "")
 
@@ -67,9 +86,10 @@ SYSTEM_PROMPT = (
     "Ты голосовой помощник в колонке. Отвечай по-русски. Обычно отвечай коротко: "
     "одно-два предложения. Если пользователь просит подробнее или пояснить, "
     "ответь развёрнуто, но не длиннее пяти предложений. Учитывай предыдущие "
-    "реплики разговора. Без списков, без markdown, без эмодзи, без ссылок — "
-    "текст будет озвучен голосом. Не называй себя Алисой. Если не знаешь ответа, "
-    "честно скажи об этом."
+    "реплики разговора. Если к вопросу приложены результаты поиска, опирайся на "
+    "них, а если в них нет ответа — так и скажи. Без списков, без markdown, без "
+    "эмодзи, без ссылок — текст будет озвучен голосом. Не называй себя Алисой. "
+    "Если не знаешь ответа, честно скажи об этом."
 )
 WELCOME_TEXT = (
     "Привет! Я отвечаю на вопросы коротко. Спроси что-нибудь, например: "
@@ -77,16 +97,24 @@ WELCOME_TEXT = (
 )
 HELP_TEXT = (
     "Просто задай вопрос своими словами, и я коротко отвечу. Если нужно больше, "
-    "скажи «поясни подробнее». Чтобы выйти, скажи «хватит»."
+    "скажи «поясни подробнее». Чтобы я поискал свежую информацию, начни со слова "
+    "«найди». Чтобы выйти, скажи «хватит»."
 )
 ABILITIES_TEXT = (
     "Я отвечаю на вопросы в одно-два предложения, помню, о чём мы говорили, "
-    "и могу пояснить подробнее. Ответы готовит нейросеть, в них возможны неточности."
+    "могу пояснить подробнее и поискать свежую информацию в интернете. "
+    "Ответы готовит нейросеть, в них возможны неточности."
 )
 FALLBACK_TEXT = "Сейчас не получается ответить, попробуй ещё раз."
 
 HELP_COMMANDS = {"помощь", "помоги", "справка"}
 ABILITIES_COMMANDS = {"что ты умеешь", "что умеешь", "что ты можешь"}
+
+MONTHS = [
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+]
+MOSCOW_TZ = timezone(timedelta(hours=3))
 
 http_client = httpx.AsyncClient()
 
@@ -124,6 +152,13 @@ def normalize(text: str) -> str:
     text = text.lower().replace("ё", "е")
     text = re.sub(r"[^\w\s]", " ", text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def current_system_prompt() -> str:
+    """Инструкция для модели + сегодняшняя дата и время по Москве."""
+    now = datetime.now(MOSCOW_TZ)
+    date_text = f"{now.day} {MONTHS[now.month - 1]} {now.year} года, {now:%H:%M} по Москве"
+    return f"{SYSTEM_PROMPT} Сейчас {date_text}."
 
 
 # =====================================================================
@@ -192,16 +227,14 @@ def is_cacheable(question_norm: str, history: list) -> bool:
     """Можно ли брать/класть этот вопрос в кэш."""
     if not CACHE_ENABLED or not memory_enabled():
         return False
-    if history:  # есть контекст разговора — ответ зависит от него, не кэшируем
+    if history:
         return False
     if not question_norm:
         return False
-    # Вопросы про "сегодня", "погоду" и т.п. быстро устаревают
     return not any(word in question_norm for word in CACHE_SKIP_WORDS)
 
 
 def cache_key(question_norm: str) -> str:
-    # Хэш — короткий "отпечаток" вопроса, чтобы ключ был одинаковой длины
     return "cache:" + hashlib.sha256(question_norm.encode("utf-8")).hexdigest()[:32]
 
 
@@ -221,6 +254,82 @@ async def cache_set(question_norm: str, answer: str):
         await redis_command("SET", cache_key(question_norm), answer, "EX", CACHE_TTL)
     except Exception as e:
         print(f"Кэш (запись) не сработал: {describe_error(e)}", flush=True)
+
+
+# =====================================================================
+# ПОИСК
+# =====================================================================
+def search_key_is_set() -> bool:
+    if SEARCH_PROVIDER == "tavily":
+        return bool(TAVILY_API_KEY)
+    if SEARCH_PROVIDER == "serper":
+        return bool(SERPER_API_KEY)
+    return False
+
+
+def needs_search(question_norm: str) -> bool:
+    """Нужен ли поиск: поиск включён, есть ключ и в вопросе есть слово-триггер."""
+    if not SEARCH_ENABLED or not search_key_is_set():
+        return False
+    return any(word in question_norm for word in SEARCH_TRIGGER_WORDS)
+
+
+async def tavily_search(query: str) -> str:
+    """Поиск через Tavily. Возвращает короткую выжимку текстом."""
+    resp = await http_client.post(
+        "https://api.tavily.com/search",
+        headers={"Authorization": f"Bearer {TAVILY_API_KEY}", "Content-Type": "application/json"},
+        json={"query": query, "search_depth": TAVILY_DEPTH, "max_results": 3},
+        timeout=10,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+    data = resp.json()
+    pieces = [
+        f"{item.get('title', '')}: {item.get('content', '')}"
+        for item in (data.get("results") or [])[:3]
+        if item.get("content")
+    ]
+    if not pieces:
+        raise RuntimeError("поиск ничего не нашёл")
+    return "\n".join(pieces)[:1500]
+
+
+async def serper_search(query: str) -> str:
+    """Поиск через Serper (Google). Возвращает короткую выжимку текстом."""
+    resp = await http_client.post(
+        "https://google.serper.dev/search",
+        headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+        json={"q": query, "gl": "ru", "hl": "ru", "num": 5},
+        timeout=10,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+    data = resp.json()
+    pieces = []
+    box = data.get("answerBox") or {}
+    if box.get("answer"):
+        pieces.append(f"Готовый ответ: {box['answer']}")
+    elif box.get("snippet"):
+        pieces.append(f"Готовый ответ: {box['snippet']}")
+    kg = data.get("knowledgeGraph") or {}
+    if kg.get("description"):
+        pieces.append(f"Справка: {kg.get('title', '')} — {kg['description']}")
+    for item in (data.get("organic") or [])[:3]:
+        if item.get("snippet"):
+            pieces.append(f"{item.get('title', '')}: {item['snippet']}")
+    if not pieces:
+        raise RuntimeError("поиск ничего не нашёл")
+    return "\n".join(pieces)[:1500]
+
+
+async def web_search(query: str) -> str:
+    """Вызывает тот поисковик, что выбран в SEARCH_PROVIDER."""
+    if SEARCH_PROVIDER == "tavily":
+        return await tavily_search(query)
+    if SEARCH_PROVIDER == "serper":
+        return await serper_search(query)
+    raise RuntimeError(f"неизвестный SEARCH_PROVIDER: {SEARCH_PROVIDER}")
 
 
 # =====================================================================
@@ -244,7 +353,7 @@ async def ask_gemini(messages: list) -> str:
         for m in messages
     ]
     payload = {
-        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "systemInstruction": {"parts": [{"text": current_system_prompt()}]},
         "contents": contents,
         "generationConfig": {"maxOutputTokens": 500, "temperature": 0.7},
     }
@@ -264,7 +373,7 @@ async def ask_openai_style(url: str, api_key: str, model: str, messages: list) -
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {
         "model": model,
-        "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + messages,
+        "messages": [{"role": "system", "content": current_system_prompt()}] + messages,
         "max_tokens": 500,
         "temperature": 0.7,
     }
@@ -331,33 +440,53 @@ async def ask_with_fallback(messages: list, total_budget: float):
 
 
 # =====================================================================
-# ГЛАВНАЯ ЛОГИКА: история -> кэш -> модели -> сохранение
+# ГЛАВНАЯ ЛОГИКА: история -> кэш -> поиск -> модели -> сохранение
 # =====================================================================
 async def answer_question(
     question: str, session_id: str, budget: float, background_tasks: BackgroundTasks
 ):
-    """
-    Возвращает (ответ или None, источник, журнал, длина_истории).
-    Источник: "cache" или имя модели.
-    """
+    """Возвращает (ответ или None, источник, журнал, длина_истории)."""
     start = time.monotonic()
+    log = []
     history = await load_history(session_id)
     question_norm = normalize(question)
-    cacheable = is_cacheable(question_norm, history)
+    search_needed = needs_search(question_norm)
+    cacheable = is_cacheable(question_norm, history) and not search_needed
 
-    # 1. Пробуем кэш
+    # 1. Кэш
     if cacheable:
         cached = await cache_get(question_norm)
         if cached:
             background_tasks.add_task(save_history, session_id, history, question, cached)
             return cached, "cache", ["кэш: попадание"], len(history)
 
-    # 2. Спрашиваем модели (время на память и кэш вычитаем из лимита)
-    messages = history + [{"role": "user", "content": question}]
-    remaining = budget - (time.monotonic() - start)
-    answer, name, log = await ask_with_fallback(messages, remaining)
+    # 2. Поиск (если нужен и есть время)
+    user_content = question
+    if search_needed:
+        time_for_search = min(
+            SEARCH_TIMEOUT, budget - (time.monotonic() - start) - TIME_LEFT_FOR_MODELS
+        )
+        if time_for_search < 0.3:
+            log.append("поиск: пропущен, мало времени")
+        else:
+            t0 = time.monotonic()
+            try:
+                results = await asyncio.wait_for(web_search(question), timeout=time_for_search)
+                user_content = (
+                    f"{question}\n\nРезультаты поиска в интернете (используй их, "
+                    f"если они относятся к вопросу):\n{results}"
+                )
+                log.append(f"поиск ({SEARCH_PROVIDER}): ок за {time.monotonic() - t0:.2f} с")
+            except Exception as e:
+                log.append(f"поиск ({SEARCH_PROVIDER}): {describe_error(e)[:150]} ({time.monotonic() - t0:.2f} с)")
 
-    # 3. Сохраняем уже после ответа
+    # 3. Модели
+    messages = history + [{"role": "user", "content": user_content}]
+    remaining = budget - (time.monotonic() - start)
+    answer, name, model_log = await ask_with_fallback(messages, remaining)
+    log += model_log
+
+    # 4. Сохраняем после ответа. В историю идёт чистый вопрос, без результатов поиска.
     if answer:
         background_tasks.add_task(save_history, session_id, history, question, answer)
         if cacheable:
@@ -382,17 +511,37 @@ async def debug(
     s: str = "",
 ):
     """
-    /debug?token=ПАРОЛЬ&q=...           — как первый вопрос в разговоре (с кэшем)
+    /debug?token=ПАРОЛЬ&q=...           — как первый вопрос в разговоре
     /debug?token=ПАРОЛЬ&s=test&q=...    — с памятью: s — имя тестовой сессии
     /debug?token=ПАРОЛЬ&only=groq       — одна модель, ждём до 25 секунд
+    /debug?token=ПАРОЛЬ&only=search&q=… — только поиск, показывает, что нашлось
     """
     if not DEBUG_TOKEN or token != DEBUG_TOKEN:
         return {"error": "нет доступа"}
 
     start = time.monotonic()
+    if only == "search":
+        if not search_key_is_set():
+            return {"ok": False, "error": f"нет ключа для поисковика {SEARCH_PROVIDER}"}
+        try:
+            results = await asyncio.wait_for(web_search(q), timeout=25)
+            return {
+                "ok": True,
+                "provider": SEARCH_PROVIDER,
+                "seconds": round(time.monotonic() - start, 2),
+                "results": results,
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "provider": SEARCH_PROVIDER,
+                "seconds": round(time.monotonic() - start, 2),
+                "error": describe_error(e),
+            }
+
     if only:
         if only not in PROVIDERS:
-            return {"error": f"нет модели {only}, есть: {list(PROVIDERS)}"}
+            return {"error": f"нет модели {only}, есть: {list(PROVIDERS)} и search"}
         try:
             answer = await asyncio.wait_for(
                 PROVIDERS[only][0]([{"role": "user", "content": q}]), timeout=25
