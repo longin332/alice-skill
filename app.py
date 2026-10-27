@@ -1,27 +1,25 @@
 import asyncio
+import json
 import os
 import re
 import time
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import BackgroundTasks, FastAPI, Request
 
 app = FastAPI()
 
 # =====================================================================
 # НАСТРОЙКИ. Всё берётся из переменных окружения Render.
-# Если переменной нет — используется значение по умолчанию (второе в скобках).
 # =====================================================================
 
-# Порядок моделей: первая — основная, дальше запасные (через запятую)
+# --- Порядок моделей и общий лимит времени ---
 PROVIDER_ORDER = [
     p.strip()
     for p in os.environ.get("PROVIDER_ORDER", "groq,gemini,openrouter").split(",")
     if p.strip()
 ]
-# Сколько секунд всего даём на все попытки (у Алисы лимит 4,5 с на весь путь)
 TOTAL_BUDGET = float(os.environ.get("TOTAL_BUDGET", "3.8"))
-# Если осталось меньше этого — следующую модель уже не пробуем
 MIN_ATTEMPT_TIME = 0.5
 
 # --- Groq ---
@@ -39,16 +37,25 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "")
 OPENROUTER_TIMEOUT = float(os.environ.get("OPENROUTER_TIMEOUT", "1.5"))
 
-# Пароль для проверочного адреса /debug. Если не задан — адрес выключен.
+# --- Память (Upstash Redis) ---
+UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "").rstrip("/")
+UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
+HISTORY_MAX_MESSAGES = int(os.environ.get("HISTORY_MAX_MESSAGES", "6"))
+HISTORY_TTL = int(os.environ.get("HISTORY_TTL", "3600"))
+MEMORY_TIMEOUT = float(os.environ.get("MEMORY_TIMEOUT", "0.5"))
+
+# --- Пароль для /debug ---
 DEBUG_TOKEN = os.environ.get("DEBUG_TOKEN", "")
 
 # =====================================================================
 # ТЕКСТЫ
 # =====================================================================
 SYSTEM_PROMPT = (
-    "Ты голосовой помощник в колонке. Отвечай по-русски, коротко: одно-два "
-    "предложения. Без списков, без markdown, без эмодзи, без ссылок — текст "
-    "будет озвучен голосом. Не называй себя Алисой. Если не знаешь ответа, "
+    "Ты голосовой помощник в колонке. Отвечай по-русски. Обычно отвечай коротко: "
+    "одно-два предложения. Если пользователь просит подробнее или пояснить, "
+    "ответь развёрнуто, но не длиннее пяти предложений. Учитывай предыдущие "
+    "реплики разговора. Без списков, без markdown, без эмодзи, без ссылок — "
+    "текст будет озвучен голосом. Не называй себя Алисой. Если не знаешь ответа, "
     "честно скажи об этом."
 )
 WELCOME_TEXT = (
@@ -56,12 +63,12 @@ WELCOME_TEXT = (
     "сколько воды пить в день. Чтобы узнать команды, скажи «помощь»."
 )
 HELP_TEXT = (
-    "Просто задай вопрос своими словами, и я коротко отвечу. "
-    "Чтобы выйти, скажи «хватит»."
+    "Просто задай вопрос своими словами, и я коротко отвечу. Если нужно больше, "
+    "скажи «поясни подробнее». Чтобы выйти, скажи «хватит»."
 )
 ABILITIES_TEXT = (
-    "Я отвечаю на вопросы в одно-два предложения: объясняю понятия, "
-    "даю советы и подсказки. Ответы готовит нейросеть, в них возможны неточности."
+    "Я отвечаю на вопросы в одно-два предложения, помню, о чём мы говорили, "
+    "и могу пояснить подробнее. Ответы готовит нейросеть, в них возможны неточности."
 )
 FALLBACK_TEXT = "Сейчас не получается ответить, попробуй ещё раз."
 
@@ -100,9 +107,70 @@ def describe_error(e: Exception) -> str:
 
 
 # =====================================================================
-# МОДЕЛИ
+# ПАМЯТЬ ДИАЛОГА (Upstash Redis)
 # =====================================================================
-async def ask_gemini(question: str) -> str:
+def memory_enabled() -> bool:
+    return bool(UPSTASH_URL and UPSTASH_TOKEN)
+
+
+async def redis_command(*args):
+    """Отправляет одну команду в Upstash, например ("GET", "ключ")."""
+    resp = await http_client.post(
+        UPSTASH_URL,
+        headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
+        json=[str(a) for a in args],
+        timeout=5,
+    )
+    data = resp.json()
+    if "error" in data:
+        raise RuntimeError(f"Upstash: {data['error']}")
+    return data.get("result")
+
+
+def history_key(session_id: str) -> str:
+    return f"hist:{session_id}"
+
+
+async def load_history(session_id: str) -> list:
+    """Достаёт историю сессии. При любой проблеме — пустая история, навык работает дальше."""
+    if not memory_enabled() or not session_id:
+        return []
+    try:
+        raw = await asyncio.wait_for(
+            redis_command("GET", history_key(session_id)), timeout=MEMORY_TIMEOUT
+        )
+        return json.loads(raw) if raw else []
+    except Exception as e:
+        print(f"Память (чтение) не сработала: {describe_error(e)}", flush=True)
+        return []
+
+
+async def save_history(session_id: str, history: list, question: str, answer: str):
+    """Добавляет пару вопрос-ответ и сохраняет. Вызывается уже ПОСЛЕ ответа Алисе."""
+    if not memory_enabled() or not session_id:
+        return
+    new_history = history + [
+        {"role": "user", "content": question},
+        {"role": "assistant", "content": answer},
+    ]
+    new_history = new_history[-HISTORY_MAX_MESSAGES:]  # храним только последние
+    try:
+        await redis_command(
+            "SET",
+            history_key(session_id),
+            json.dumps(new_history, ensure_ascii=False),
+            "EX",
+            HISTORY_TTL,
+        )
+    except Exception as e:
+        print(f"Память (запись) не сработала: {describe_error(e)}", flush=True)
+
+
+# =====================================================================
+# МОДЕЛИ. Все принимают messages — список реплик:
+# [{"role": "user" или "assistant", "content": "текст"}, ...]
+# =====================================================================
+async def ask_gemini(messages: list) -> str:
     """Запрос к Gemini."""
     if not GEMINI_API_KEY:
         raise RuntimeError("нет ключа GEMINI_API_KEY")
@@ -111,10 +179,18 @@ async def ask_gemini(question: str) -> str:
         f"{GEMINI_MODEL}:generateContent"
     )
     headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
+    # У Gemini ответы модели называются "model", а не "assistant"
+    contents = [
+        {
+            "role": "model" if m["role"] == "assistant" else "user",
+            "parts": [{"text": m["content"]}],
+        }
+        for m in messages
+    ]
     payload = {
         "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-        "contents": [{"role": "user", "parts": [{"text": question}]}],
-        "generationConfig": {"maxOutputTokens": 400, "temperature": 0.7},
+        "contents": contents,
+        "generationConfig": {"maxOutputTokens": 500, "temperature": 0.7},
     }
     resp = await http_client.post(url, headers=headers, json=payload, timeout=30)
     if resp.status_code != 200:
@@ -127,16 +203,13 @@ async def ask_gemini(question: str) -> str:
     return answer
 
 
-async def ask_openai_style(url: str, api_key: str, model: str, question: str) -> str:
-    """Запрос к сервисам с форматом как у OpenAI (Groq и OpenRouter устроены так)."""
+async def ask_openai_style(url: str, api_key: str, model: str, messages: list) -> str:
+    """Запрос к сервисам с форматом как у OpenAI (Groq и OpenRouter)."""
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": question},
-        ],
-        "max_tokens": 300,
+        "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + messages,
+        "max_tokens": 500,
         "temperature": 0.7,
     }
     resp = await http_client.post(url, headers=headers, json=payload, timeout=30)
@@ -149,26 +222,25 @@ async def ask_openai_style(url: str, api_key: str, model: str, question: str) ->
     return answer
 
 
-async def ask_groq(question: str) -> str:
+async def ask_groq(messages: list) -> str:
     if not GROQ_API_KEY:
         raise RuntimeError("нет ключа GROQ_API_KEY")
     return await ask_openai_style(
-        "https://api.groq.com/openai/v1/chat/completions", GROQ_API_KEY, GROQ_MODEL, question
+        "https://api.groq.com/openai/v1/chat/completions", GROQ_API_KEY, GROQ_MODEL, messages
     )
 
 
-async def ask_openrouter(question: str) -> str:
+async def ask_openrouter(messages: list) -> str:
     if not OPENROUTER_API_KEY or not OPENROUTER_MODEL:
         raise RuntimeError("не заданы OPENROUTER_API_KEY или OPENROUTER_MODEL")
     return await ask_openai_style(
         "https://openrouter.ai/api/v1/chat/completions",
         OPENROUTER_API_KEY,
         OPENROUTER_MODEL,
-        question,
+        messages,
     )
 
 
-# Название -> (функция, сколько максимум ждём эту модель)
 PROVIDERS = {
     "groq": (ask_groq, GROQ_TIMEOUT),
     "gemini": (ask_gemini, GEMINI_TIMEOUT),
@@ -176,11 +248,8 @@ PROVIDERS = {
 }
 
 
-async def ask_with_fallback(question: str, total_budget: float):
-    """
-    Пробует модели по очереди из PROVIDER_ORDER.
-    Возвращает (ответ, имя_модели, журнал). Если никто не ответил — (None, None, журнал).
-    """
+async def ask_with_fallback(messages: list, total_budget: float):
+    """Пробует модели по очереди. Возвращает (ответ, имя_модели, журнал)."""
     start = time.monotonic()
     log = []
     for name in PROVIDER_ORDER:
@@ -197,8 +266,7 @@ async def ask_with_fallback(question: str, total_budget: float):
 
         t0 = time.monotonic()
         try:
-            # wait_for жёстко обрывает запрос, если он идёт дольше timeout
-            answer = await asyncio.wait_for(func(question), timeout=timeout)
+            answer = await asyncio.wait_for(func(messages), timeout=timeout)
             log.append(f"{name}: ок за {time.monotonic() - t0:.2f} с")
             return answer, name, log
         except Exception as e:
@@ -215,11 +283,17 @@ def health_check():
 
 
 @app.get("/debug")
-async def debug(token: str = "", q: str = "Сколько планет в Солнечной системе?", only: str = ""):
+async def debug(
+    background_tasks: BackgroundTasks,
+    token: str = "",
+    q: str = "Сколько планет в Солнечной системе?",
+    only: str = "",
+    s: str = "",
+):
     """
-    Проверка в браузере.
-    /debug?token=ПАРОЛЬ            — вся цепочка, как для Алисы (с лимитом времени)
-    /debug?token=ПАРОЛЬ&only=groq  — только одна модель, ждём до 25 секунд
+    /debug?token=ПАРОЛЬ                 — вся цепочка, без памяти
+    /debug?token=ПАРОЛЬ&only=groq       — одна модель, ждём до 25 секунд
+    /debug?token=ПАРОЛЬ&s=test&q=...    — с памятью: s — имя тестовой сессии
     """
     if not DEBUG_TOKEN or token != DEBUG_TOKEN:
         return {"error": "нет доступа"}
@@ -229,24 +303,33 @@ async def debug(token: str = "", q: str = "Сколько планет в Сол
         if only not in PROVIDERS:
             return {"error": f"нет модели {only}, есть: {list(PROVIDERS)}"}
         try:
-            answer = await asyncio.wait_for(PROVIDERS[only][0](q), timeout=25)
+            answer = await asyncio.wait_for(
+                PROVIDERS[only][0]([{"role": "user", "content": q}]), timeout=25
+            )
             return {"ok": True, "provider": only, "seconds": round(time.monotonic() - start, 2), "answer": answer}
         except Exception as e:
             return {"ok": False, "provider": only, "seconds": round(time.monotonic() - start, 2), "error": describe_error(e)}
 
-    answer, name, log = await ask_with_fallback(q, TOTAL_BUDGET)
+    session_id = f"debug-{s}" if s else ""
+    history = await load_history(session_id)
+    messages = history + [{"role": "user", "content": q}]
+    answer, name, log = await ask_with_fallback(messages, TOTAL_BUDGET)
+    if answer and session_id:
+        background_tasks.add_task(save_history, session_id, history, q, answer)
     return {
         "ok": answer is not None,
         "answered_by": name,
         "seconds": round(time.monotonic() - start, 2),
         "answer": answer or FALLBACK_TEXT,
+        "history_before": len(history),
+        "memory_enabled": memory_enabled(),
         "log": log,
-        "order": PROVIDER_ORDER,
     }
 
 
 @app.post("/")
-async def alice_webhook(request: Request):
+async def alice_webhook(request: Request, background_tasks: BackgroundTasks):
+    request_start = time.monotonic()
     try:
         data = await request.json()
     except Exception:
@@ -256,6 +339,7 @@ async def alice_webhook(request: Request):
     session = data.get("session", {})
     command = req.get("command", "").strip().lower()
     utterance = req.get("original_utterance", "").strip()
+    session_id = session.get("session_id", "")
 
     if utterance.lower() == "ping":
         return make_response("pong")
@@ -271,6 +355,17 @@ async def alice_webhook(request: Request):
     if not command:
         return make_response("Не расслышал, повтори, пожалуйста.")
 
-    answer, name, log = await ask_with_fallback(utterance or command, TOTAL_BUDGET)
-    print(f"Вопрос: {utterance!r} | " + " | ".join(log), flush=True)
-    return make_response(answer if answer else FALLBACK_TEXT)
+    question = utterance or command
+    history = await load_history(session_id)
+    messages = history + [{"role": "user", "content": question}]
+
+    # Время, потраченное на чтение памяти, вычитаем из общего лимита
+    budget = TOTAL_BUDGET - (time.monotonic() - request_start)
+    answer, name, log = await ask_with_fallback(messages, budget)
+    print(f"Вопрос: {utterance!r} | история: {len(history)} | " + " | ".join(log), flush=True)
+
+    if answer:
+        # Сохраняем уже ПОСЛЕ того, как ответ ушёл Алисе
+        background_tasks.add_task(save_history, session_id, history, question, answer)
+        return make_response(answer)
+    return make_response(FALLBACK_TEXT)
