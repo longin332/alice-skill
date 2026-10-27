@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -24,7 +25,7 @@ MIN_ATTEMPT_TIME = 0.5
 
 # --- Groq ---
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b")
 GROQ_TIMEOUT = float(os.environ.get("GROQ_TIMEOUT", "2.0"))
 
 # --- Gemini ---
@@ -43,6 +44,18 @@ UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
 HISTORY_MAX_MESSAGES = int(os.environ.get("HISTORY_MAX_MESSAGES", "6"))
 HISTORY_TTL = int(os.environ.get("HISTORY_TTL", "3600"))
 MEMORY_TIMEOUT = float(os.environ.get("MEMORY_TIMEOUT", "0.5"))
+
+# --- Кэш (тоже в Upstash) ---
+CACHE_ENABLED = os.environ.get("CACHE_ENABLED", "1") == "1"
+CACHE_TTL = int(os.environ.get("CACHE_TTL", "86400"))
+CACHE_SKIP_WORDS = [
+    w.strip()
+    for w in os.environ.get(
+        "CACHE_SKIP_WORDS",
+        "сегодня,сейчас,завтра,вчера,погод,курс,новост,который час,время,дата,число",
+    ).split(",")
+    if w.strip()
+]
 
 # --- Пароль для /debug ---
 DEBUG_TOKEN = os.environ.get("DEBUG_TOKEN", "")
@@ -106,8 +119,15 @@ def describe_error(e: Exception) -> str:
     return f"{type(e).__name__}: {e}"
 
 
+def normalize(text: str) -> str:
+    """Приводит вопрос к единому виду: маленькие буквы, е вместо ё, без знаков."""
+    text = text.lower().replace("ё", "е")
+    text = re.sub(r"[^\w\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 # =====================================================================
-# ПАМЯТЬ ДИАЛОГА (Upstash Redis)
+# РАБОТА С UPSTASH (память и кэш)
 # =====================================================================
 def memory_enabled() -> bool:
     return bool(UPSTASH_URL and UPSTASH_TOKEN)
@@ -127,12 +147,13 @@ async def redis_command(*args):
     return data.get("result")
 
 
+# ---------- Память диалога ----------
 def history_key(session_id: str) -> str:
     return f"hist:{session_id}"
 
 
 async def load_history(session_id: str) -> list:
-    """Достаёт историю сессии. При любой проблеме — пустая история, навык работает дальше."""
+    """Достаёт историю сессии. При любой проблеме — пустая история."""
     if not memory_enabled() or not session_id:
         return []
     try:
@@ -146,14 +167,14 @@ async def load_history(session_id: str) -> list:
 
 
 async def save_history(session_id: str, history: list, question: str, answer: str):
-    """Добавляет пару вопрос-ответ и сохраняет. Вызывается уже ПОСЛЕ ответа Алисе."""
+    """Добавляет пару вопрос-ответ и сохраняет. Вызывается ПОСЛЕ ответа Алисе."""
     if not memory_enabled() or not session_id:
         return
     new_history = history + [
         {"role": "user", "content": question},
         {"role": "assistant", "content": answer},
     ]
-    new_history = new_history[-HISTORY_MAX_MESSAGES:]  # храним только последние
+    new_history = new_history[-HISTORY_MAX_MESSAGES:]
     try:
         await redis_command(
             "SET",
@@ -164,6 +185,42 @@ async def save_history(session_id: str, history: list, question: str, answer: st
         )
     except Exception as e:
         print(f"Память (запись) не сработала: {describe_error(e)}", flush=True)
+
+
+# ---------- Кэш ответов ----------
+def is_cacheable(question_norm: str, history: list) -> bool:
+    """Можно ли брать/класть этот вопрос в кэш."""
+    if not CACHE_ENABLED or not memory_enabled():
+        return False
+    if history:  # есть контекст разговора — ответ зависит от него, не кэшируем
+        return False
+    if not question_norm:
+        return False
+    # Вопросы про "сегодня", "погоду" и т.п. быстро устаревают
+    return not any(word in question_norm for word in CACHE_SKIP_WORDS)
+
+
+def cache_key(question_norm: str) -> str:
+    # Хэш — короткий "отпечаток" вопроса, чтобы ключ был одинаковой длины
+    return "cache:" + hashlib.sha256(question_norm.encode("utf-8")).hexdigest()[:32]
+
+
+async def cache_get(question_norm: str):
+    try:
+        raw = await asyncio.wait_for(
+            redis_command("GET", cache_key(question_norm)), timeout=MEMORY_TIMEOUT
+        )
+        return raw or None
+    except Exception as e:
+        print(f"Кэш (чтение) не сработал: {describe_error(e)}", flush=True)
+        return None
+
+
+async def cache_set(question_norm: str, answer: str):
+    try:
+        await redis_command("SET", cache_key(question_norm), answer, "EX", CACHE_TTL)
+    except Exception as e:
+        print(f"Кэш (запись) не сработал: {describe_error(e)}", flush=True)
 
 
 # =====================================================================
@@ -179,7 +236,6 @@ async def ask_gemini(messages: list) -> str:
         f"{GEMINI_MODEL}:generateContent"
     )
     headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
-    # У Gemini ответы модели называются "model", а не "assistant"
     contents = [
         {
             "role": "model" if m["role"] == "assistant" else "user",
@@ -275,6 +331,41 @@ async def ask_with_fallback(messages: list, total_budget: float):
 
 
 # =====================================================================
+# ГЛАВНАЯ ЛОГИКА: история -> кэш -> модели -> сохранение
+# =====================================================================
+async def answer_question(
+    question: str, session_id: str, budget: float, background_tasks: BackgroundTasks
+):
+    """
+    Возвращает (ответ или None, источник, журнал, длина_истории).
+    Источник: "cache" или имя модели.
+    """
+    start = time.monotonic()
+    history = await load_history(session_id)
+    question_norm = normalize(question)
+    cacheable = is_cacheable(question_norm, history)
+
+    # 1. Пробуем кэш
+    if cacheable:
+        cached = await cache_get(question_norm)
+        if cached:
+            background_tasks.add_task(save_history, session_id, history, question, cached)
+            return cached, "cache", ["кэш: попадание"], len(history)
+
+    # 2. Спрашиваем модели (время на память и кэш вычитаем из лимита)
+    messages = history + [{"role": "user", "content": question}]
+    remaining = budget - (time.monotonic() - start)
+    answer, name, log = await ask_with_fallback(messages, remaining)
+
+    # 3. Сохраняем уже после ответа
+    if answer:
+        background_tasks.add_task(save_history, session_id, history, question, answer)
+        if cacheable:
+            background_tasks.add_task(cache_set, question_norm, answer)
+    return answer, name, log, len(history)
+
+
+# =====================================================================
 # АДРЕСА СЕРВЕРА
 # =====================================================================
 @app.api_route("/", methods=["GET", "HEAD"])
@@ -291,9 +382,9 @@ async def debug(
     s: str = "",
 ):
     """
-    /debug?token=ПАРОЛЬ                 — вся цепочка, без памяти
-    /debug?token=ПАРОЛЬ&only=groq       — одна модель, ждём до 25 секунд
+    /debug?token=ПАРОЛЬ&q=...           — как первый вопрос в разговоре (с кэшем)
     /debug?token=ПАРОЛЬ&s=test&q=...    — с памятью: s — имя тестовой сессии
+    /debug?token=ПАРОЛЬ&only=groq       — одна модель, ждём до 25 секунд
     """
     if not DEBUG_TOKEN or token != DEBUG_TOKEN:
         return {"error": "нет доступа"}
@@ -311,17 +402,15 @@ async def debug(
             return {"ok": False, "provider": only, "seconds": round(time.monotonic() - start, 2), "error": describe_error(e)}
 
     session_id = f"debug-{s}" if s else ""
-    history = await load_history(session_id)
-    messages = history + [{"role": "user", "content": q}]
-    answer, name, log = await ask_with_fallback(messages, TOTAL_BUDGET)
-    if answer and session_id:
-        background_tasks.add_task(save_history, session_id, history, q, answer)
+    answer, source, log, history_len = await answer_question(
+        q, session_id, TOTAL_BUDGET, background_tasks
+    )
     return {
         "ok": answer is not None,
-        "answered_by": name,
+        "answered_by": source,
         "seconds": round(time.monotonic() - start, 2),
         "answer": answer or FALLBACK_TEXT,
-        "history_before": len(history),
+        "history_before": history_len,
         "memory_enabled": memory_enabled(),
         "log": log,
     }
@@ -356,16 +445,9 @@ async def alice_webhook(request: Request, background_tasks: BackgroundTasks):
         return make_response("Не расслышал, повтори, пожалуйста.")
 
     question = utterance or command
-    history = await load_history(session_id)
-    messages = history + [{"role": "user", "content": question}]
-
-    # Время, потраченное на чтение памяти, вычитаем из общего лимита
     budget = TOTAL_BUDGET - (time.monotonic() - request_start)
-    answer, name, log = await ask_with_fallback(messages, budget)
-    print(f"Вопрос: {utterance!r} | история: {len(history)} | " + " | ".join(log), flush=True)
-
-    if answer:
-        # Сохраняем уже ПОСЛЕ того, как ответ ушёл Алисе
-        background_tasks.add_task(save_history, session_id, history, question, answer)
-        return make_response(answer)
-    return make_response(FALLBACK_TEXT)
+    answer, source, log, history_len = await answer_question(
+        question, session_id, budget, background_tasks
+    )
+    print(f"Вопрос: {utterance!r} | история: {history_len} | " + " | ".join(log), flush=True)
+    return make_response(answer if answer else FALLBACK_TEXT)
